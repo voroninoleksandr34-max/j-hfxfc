@@ -1,0 +1,28 @@
+# Основные
+pandas
+numpy
+joblib
+scipy
+scikit-learn
+arch
+
+# ML / AI
+hmmlearn
+google-generativeai
+openai
+
+# Финансы и TA
+ta
+TA-Lib
+mplfinance
+python-binance
+
+# Асинхронность и Сеть
+aiofiles
+httpx
+aiohttp
+websockets
+
+# Утилиты
+matplotlib
+python-telegram-bot

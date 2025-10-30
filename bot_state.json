@@ -1,0 +1,78 @@
+{
+  "SEIUSDT": {
+    "side": "SHORT",
+    "current_quantity": 177.0,
+    "entry_price": 0.19280000000000003,
+    "sl_price": 0.1809,
+    "tp1_price": 0.18678000000000003,
+    "initial_sl_price": 0.20140000000000002,
+    "initial_quantity": 104.0,
+    "state": "initial",
+    "entry_timestamp": 1761845798.358218,
+    "meta": {
+      "tp1_order_id": 7811791966,
+      "scaling_plan": {},
+      "atr_trail_active": true,
+      "strategy_type": "trend",
+      "be_done": true,
+      "unrealized_pnl": 2.45876718,
+      "sl_order_id": 7813472922
+    },
+    "symbol": "SEIUSDT",
+    "amount": 177.0,
+    "initial_amount": 104.0,
+    "sl_order_id": 7813472922,
+    "tp1_order_id": 7811791966,
+    "tp2_order_id": null
+  },
+  "SOLUSDT": {
+    "side": "SHORT",
+    "current_quantity": 0.2,
+    "entry_price": 186.89,
+    "sl_price": 183.3,
+    "tp1_price": 178.75599999999997,
+    "initial_sl_price": 198.51,
+    "initial_quantity": 0.1,
+    "state": "initial",
+    "entry_timestamp": 1761845798.358218,
+    "meta": {
+      "scaling_plan": {},
+      "atr_trail_active": true,
+      "strategy_type": "trend",
+      "unrealized_pnl": 1.022,
+      "be_done": true,
+      "sl_order_id": 165349550839
+    },
+    "symbol": "SOLUSDT",
+    "amount": 0.2,
+    "initial_amount": 0.1,
+    "sl_order_id": 165349550839,
+    "tp1_order_id": null,
+    "tp2_order_id": null
+  },
+  "ENAUSDT": {
+    "side": "SHORT",
+    "current_quantity": 49.0,
+    "entry_price": 0.4079,
+    "sl_price": 0.389,
+    "tp1_price": 0.38255999999999996,
+    "initial_sl_price": 0.4441,
+    "initial_quantity": 49.0,
+    "state": "initial",
+    "entry_timestamp": 1761845798.3592196,
+    "meta": {
+      "scaling_plan": {},
+      "atr_trail_active": true,
+      "strategy_type": "trend",
+      "unrealized_pnl": 1.1967613,
+      "be_done": true,
+      "sl_order_id": 12194076877
+    },
+    "symbol": "ENAUSDT",
+    "amount": 49.0,
+    "initial_amount": 49.0,
+    "sl_order_id": 12194076877,
+    "tp1_order_id": null,
+    "tp2_order_id": null
+  }
+}
