@@ -149,7 +149,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/v1/chat/completions"
 
 
 # Полный URL для прямых запросов через httpx (для старой текстовой функции)
-GEMINI_API_KEY = "AIzaSyBvqKmsQ7WnjWrRq4scMSKR0ZGW90qlvLM"  # <--- ВСТАВЬТЕ ВАШ КЛЮЧ ВМЕСТО ЭТОЙ СТРОКИ
+GEMINI_API_KEY = "AIzaSyBKKuUZsaEcU_Jn4gPWqQS_Uf679Csv8EU"  # <--- ВСТАВЬТЕ ВАШ КЛЮЧ ВМЕСТО ЭТОЙ СТРОКИ
 # <<< КОНЕЦ ИЗМЕНЕНИЯ >>>
 
 
@@ -281,7 +281,7 @@ CONSECUTIVE_LOSSES = 0
 
 # --- ОБЩИЕ ФИЛЬТРЫ СТРАТЕГИИ ---
 ENFORCE_UNIDIRECTIONAL_TRADES = True
-BTC_TREND_FILTER_ENABLED = True             
+BTC_TREND_FILTER_ENABLED = False             
 TREND_VOLUME_MULTIPLIER = 1.5               
 AI_CONSOLIDATION_FILTER_ENABLED = True
 MULTI_TF_TREND_FILTER_ENABLED = False
@@ -2458,9 +2458,8 @@ class PositionManager:
         """
         Надежно закрывает часть позиции, отменяет все TP ордера и
         ПЕРЕУСТАНАВЛИВАЕТ SL (В БЕЗУБЫТОК) и АКТИВИРУЕТ ТРЕЙЛИНГ.
-        ИСПРАВЛЕНО (v3.2): 
-        - Не закрывает всю позицию при ошибке minNotional.
-        - ✅ Немедленно сохраняет состояние (save_state_async) после изменения current_quantity.
+        ИСПРАВЛЕНО (v3.2): Не закрывает всю позицию при ошибке minNotional,
+                         корректно переустанавливает SL на ОСТАТОК.
         """
         pos = self.state
         log_prefix = f"[{self.symbol}] [Partial Close]"
@@ -2486,13 +2485,15 @@ class PositionManager:
         min_notional = float(exchange_info_cache.get(self.symbol, {}).get('minNotional', 5.1))
         notional_value = qty_to_close * current_price
         
-        # (Проверка minNotional - уже исправлена)
+        # ✅ ИСПРАВЛЕНИЕ (Ошибка №3): Не закрываем всю позицию
         if notional_value < min_notional and qty_to_close < pos.current_quantity:
             logging.warning(
                 f"{log_prefix} {reason}: Частичное закрытие невозможно (стоимость ${notional_value:.2f} < ${min_notional:.2f}). "
                 f"ПРОПУСКАЮ частичное закрытие."
             )
+            # НЕ закрываем всю позицию, а просто пропускаем этот шаг
             qty_to_close = 0.0 
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
         
         if qty_to_close > 0:
             close_side = 'SELL' if pos.side.upper() == 'LONG' else 'BUY'
@@ -2500,21 +2501,15 @@ class PositionManager:
             if closing_order and closing_order.get('orderId'):
                 pos.current_quantity -= qty_to_close
                 await send_telegram_message(f"💰 **{self.symbol}**: {reason} - зафиксировано **{qty_to_close}** ед.")
-                
-                # --- ✅ ИСПРАВЛЕНИЕ (Ошибка №3): Немедленное сохранение состояния ---
-                await save_state_async()
-                logging.info(f"{log_prefix} Объем позиции {pos.current_quantity} немедленно сохранен.")
-                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-                
             else:
                 logging.error(f"{log_prefix} Не удалось отправить ордер на частичное закрытие! ({reason})")
                 return 
         
-        # --- 3. УСТАНОВКА BE И АКТИВАЦИЯ ТРЕЙЛИНГА ---
+        # --- 3. УСТАНОВКА BE И АКТИВАЦИЯ ТРЕЙЛИНГА (ИСПРАВЛЕНО Ошибка №4, №6, №7) ---
         pos.meta["tp1_done"] = True # Отмечаем, что TP1 выполнен
         
         if pos.current_quantity > 0:
-            # (Логика установки BE/SL - остается как в v2.8.5, она уже исправлена)
+            # Рассчитываем BE + буфер
             df_work_tf = market_data_store.get(self.symbol, {}).get(ALLOWED_INTERVALS['15m'])
             atr_value = _atr(df_work_tf, 21) if (df_work_tf is not None and not df_work_tf.empty) else (pos.entry_price * 0.005)
             if atr_value <= 0: atr_value = pos.entry_price * 0.005
@@ -2532,22 +2527,23 @@ class PositionManager:
 
             final_be_sl_price = float(formatted_be_sl_price_str)
             
+            # Используем replace_order_safe для атомарной замены SL
             if await replace_order_safe(self, "sl_order_id", 
-                                      lambda: self._place_updated_sl(final_be_sl_price),
+                                      lambda: self._place_updated_sl(final_be_sl_price), # _place_updated_sl САМ возьмет pos.current_quantity
                                       f"BE + Buffer after {reason}"):
                 
-                pos.sl_price = final_be_sl_price
+                pos.sl_price = final_be_sl_price # Сохраняем ФАКТИЧЕСКУЮ цену ордера
                 pos.meta["be_done"] = True
                 pos.meta["atr_trail_active"] = True 
                 logging.info(f"{log_prefix} BE установлен ({pos.sl_price:.5f}). АВТО-ТРЕЙЛИНГ АКТИВИРОВАН.")
         
         else:
+            # Если позиция полностью закрыта, отменяем SL
             logging.warning(f"{log_prefix} Позиция полностью закрыта после фиксации прибыли.")
             await replace_order_safe(self, "sl_order_id", lambda: asyncio.sleep(0), "Position fully closed on partial")
             if self.symbol in current_positions:
                 del current_positions[self.symbol]
         
-        # Сохраняем состояние в конце функции (это сохранение покрывает установку BE/трейлинга)
         await save_state_async()
 
     async def _cancel_order_by_key(self, key: str, reason: str):
@@ -3782,9 +3778,10 @@ async def global_direction_verdict(trade_type: str) -> Tuple[bool, str, Dict[str
         reason = f"BTC state={state}, p_up={p_up:.2f}"
         return ok, reason, snap
 
-async def estimate_market_liquidity(symbol: str) -> float:
+async def estimate_market_liquidity(symbol: str) -> Tuple[float, float]:
     """
-    Продвинутая оценка ликвидности (0-10) на основе объема, глубины стакана и спреда.
+    Продвинутая оценка ликвидности (0-10) И Спреда (%).
+    Возвращает (final_score, spread_percent)
     """
     try:
         # Используем один вызов для получения последней цены, которая нужна для расчета глубины в USDT
@@ -3811,10 +3808,15 @@ async def estimate_market_liquidity(symbol: str) -> float:
         
         final_score = (volume_score * 0.4) + (depth_score * 0.4) + (spread_score * 0.2)
         logging.info(f"[{symbol}] Оценка ликвидности: {final_score:.1f}/10 (Объем: {volume_24h_usdt:,.0f}, Глубина: {total_depth_usdt:,.0f}, Спред: {spread_percent:.4f}%)")
-        return final_score
+        
+        # --- ИЗМЕНЕНИЕ: Возвращаем кортеж (score, spread) ---
+        return final_score, spread_percent
+        
     except Exception as e:
         logging.error(f"[{symbol}] Ошибка оценки ликвидности: {e}")
-        return 0.0 # В случае ошибки считаем ликвидность нулевой
+        
+        # --- ИЗМЕНЕНИЕ: Возвращаем кортеж с плохими значениями ---
+        return 0.0, 999.0 # В случае ошибки считаем ликвидность 0 и спред огромным
 
 async def get_correlation_snapshot(symbol1: str, symbol2: str, period: int = 50) -> float:
     """Рассчитывает корреляцию Пирсона между двумя активами."""
@@ -4377,25 +4379,29 @@ async def calculate_quantitative_sltp(symbol: str, side: str, entry_price: float
 
 async def unified_liquidity_filter(symbol: str) -> tuple[bool, str]:
     """
-    Реализует двухуровневый гейт ликвидности:
+    Реализует двухуровневый гейт ликвидности (V2):
     1. TOP_CAP_SYMBOLS пропускаются всегда.
-    2. Для остальных монет используется оценка ликвидности (0-10) с мягким порогом.
+    2. Для остальных: скор >= 5.0 И спред <= 0.15%.
     """
-    # Уровень 1: Пропускаем топ-монеты без проверки
+    # Уровень 1: ...
     if symbol in TOP_CAP_SYMBOLS:
         return True, "Top-cap symbol, liquidity check skipped."
 
     # Уровень 2: Проверка для остальных монет по скоринг-системе
-    # Мягкий порог в 3.0 (вместо 4.0, как было ранее)
-    LIQUIDITY_SCORE_THRESHOLD = 3.0 
+    LIQUIDITY_SCORE_THRESHOLD = 4.0 
+    MAX_SPREAD_PERCENT = 0.15 # <-- НОВЫЙ ПОРОГ
     
-    liquidity_score = await estimate_market_liquidity(symbol)
+    liquidity_score, spread_percent = await estimate_market_liquidity(symbol)
     
     if liquidity_score < LIQUIDITY_SCORE_THRESHOLD:
         reason = f"Низкая ликвидность (скор: {liquidity_score:.1f} < {LIQUIDITY_SCORE_THRESHOLD})"
         return False, reason
         
-    return True, f"Liquidity score OK ({liquidity_score:.1f})"
+    if spread_percent > MAX_SPREAD_PERCENT:
+        reason = f"Слишком большой спред ({spread_percent:.3f}% > {MAX_SPREAD_PERCENT}%)"
+        return False, reason
+        
+    return True, f"Liquidity score OK ({liquidity_score:.1f}), Spread OK ({spread_percent:.3f}%)"
 
 def get_symbol_price_step(symbol: str) -> Optional[float]:
     """Извлекает шаг цены (tickSize) из кэша биржевой информации."""
@@ -5463,7 +5469,7 @@ async def process_message(msg: Dict[str, Any]):
             # --- ВЫЗОВ СООТВЕТСТВУЮЩИХ СТРАТЕГИЙ ---
             if market_regime == "FLAT":
                 logging.warning(f"[{symbol}] РЕЖИМ: ФЛЭТ (ADX={adx_value:.1f}). Запуск Ranging (V5.0)...")
-                await find_and_execute_ranging_trade_v4_3(symbol)
+                # await find_and_execute_ranging_trade_v4_3(symbol)
 
             elif market_regime == "TREND":
                 logging.warning(f"[{symbol}] РЕЖИМ: ТРЕНД (ADX={adx_value:.1f}). Запуск Трендовых (V2.0)...")
@@ -5499,7 +5505,7 @@ async def process_message(msg: Dict[str, Any]):
             df1h = df_to_update
             try:
                 if len(df1h) >= 20:
-                    adx1h_series = ta.trend.adx(df1h['high'], df1h['low'], df1h['close'], window=14)
+                    adx1h_series = adx(df1h['high'], df1h['low'], df1h['close'], window=14)
                     if not adx1h_series.empty:
                         adx1h = adx1h_series.iloc[-1]
                         if pd.notna(adx1h) and adx1h > 25.0:
@@ -9097,7 +9103,6 @@ def calculate_unified_entry_score_v2(
 async def manage_donchian_trailing_stop(manager: PositionManager):
     """
     Управляет трейлинг-стопом на основе средней линии Канала Дончиана и ATR.
-    ИСПРАВЛЕНО (v3.1): Исправлен неверный вызов _update_sl_callback (убран лишний 'symbol').
     """
     pos = manager.state
     df = market_data_store.get(manager.symbol, {}).get(ALLOWED_INTERVALS['1h'])
@@ -9115,19 +9120,15 @@ async def manage_donchian_trailing_stop(manager: PositionManager):
         
         if pos.side.upper() == 'LONG' and pos.sl_price is not None:
             potential_new_sl = last_middle_line - volatility_buffer
-            # Проверяем, что новый SL выгоднее (выше)
             if potential_new_sl > pos.sl_price:
                 logging.warning(f"📈 [{manager.symbol}] TRAILING STOP (Donchian): SL перемещается с {pos.sl_price:.4f} на {potential_new_sl:.4f}")
-                # --- ✅ ИСПРАВЛЕНИЕ (Убран manager.symbol, reason в кавычках) ---
-                await manager._update_sl_callback(potential_new_sl, "Donchian Trail")
+                await manager._update_sl_callback(manager.symbol, potential_new_sl, "Donchian Trail")
 
         elif pos.side.upper() == 'SHORT' and pos.sl_price is not None:
             potential_new_sl = last_middle_line + volatility_buffer
-            # Проверяем, что новый SL выгоднее (ниже)
             if potential_new_sl < pos.sl_price:
                 logging.warning(f"📉 [{manager.symbol}] TRAILING STOP (Donchian): SL перемещается с {pos.sl_price:.4f} на {potential_new_sl:.4f}")
-                # --- ✅ ИСПРАВЛЕНИЕ (Убран manager.symbol, reason в кавычках) ---
-                await manager._update_sl_callback(potential_new_sl, "Donchian Trail")
+                await manager._update_sl_callback(manager.symbol, potential_new_sl, "Donchian Trail")
 
     except Exception as e:
         logging.error(f"[{manager.symbol}] Ошибка в логике трейлинга по Дончиану: {e}")
@@ -9652,7 +9653,7 @@ async def check_btc_for_emergency_exit():
         c = last_closed(df)
         if c is None: return None
         try:
-            atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], 14).iloc[-2]
+            atr = average_true_range(df['high'], df['low'], df['close'], 14).iloc[-2]
             close = float(c['close']); open_ = float(c['open'])
             vol = float(c['volume'])
             # Убедимся, что индекс не выходит за границы при расчете MA
@@ -11955,84 +11956,508 @@ async def should_close_dead_position_ai_verdict(symbol: str, side: str, holding_
         return default_response
 
 
-async def get_sltp_from_ai_async(symbol: str, side: str, entry_price: float, context: dict) -> Dict[str, Optional[float]]:
-    """
-    Получает от AI интеллектуальные уровни SL/TP1/TP2.
-    ФИНАЛЬНАЯ ВЕРСИЯ (Патч 3).
-    """
-    log_prefix = f"[{symbol}] [AI SL/TP]"
-    logging.info(f"{log_prefix} Запуск интеллектуального расчета уровней...")
+# ============================================================================
+# НАЧАЛО БЛОКА: АНАЛИЗ SL/TP ЧЕРЕЗ GEMINI И СТАКАН ЗАЯВОК (V-GEMINI-OB)
+# ============================================================================
 
-    # --- Шаг 1: Сбор контекста и РАСЧЕТ НАДЕЖНОГО ФОЛБЭКА ---
+async def get_orderbook_snapshot(symbol: str, depth: int = 50) -> Dict[str, Any]:
+    """
+    Получает срез стакана заявок с Binance Futures.
+    
+    Args:
+        symbol: Торговая пара (например, 'BTCUSDT')
+        depth: Глубина стакана - ТОЛЬКО [5, 10, 20, 50, 100, 500, 1000]
+    
+    Returns:
+        Dict с bids, asks и метриками
+    """
     try:
-        df_15m = market_data_store.get(symbol, {}).get(ALLOWED_INTERVALS['15m'])
-        if df_15m is None or len(df_15m) < 50: raise ValueError("Недостаточно данных на 15м")
-        atr_val = _atr(df_15m, 14)
-        if atr_val <= 0: raise ValueError("Невалидный ATR")
+        # Валидация depth - только допустимые значения для Binance Futures
+        valid_depths = [5, 10, 20, 50, 100, 500, 1000]
+        if depth not in valid_depths:
+            # Округляем до ближайшего допустимого значения
+            depth = min(valid_depths, key=lambda x: abs(x - depth))
+            logging.warning(f"{symbol} | Depth скорректирован до {depth} (допустимые: {valid_depths})")
         
-        # Расчет безопасных уровней, которые будут использованы, если AI ошибется
-        base_sl_atr = entry_price - (atr_val * DEFAULT_ATR_MULTIPLIER) if side.upper() == "LONG" else entry_price + (atr_val * DEFAULT_ATR_MULTIPLIER)
-        structural_sl = find_structural_level(df_15m, side, lookback=40)
+        # Получаем стакан через Binance API
+        orderbook = await client.futures_order_book(symbol=symbol, limit=depth)
         
-        fallback_sl = base_sl_atr
-        if side.upper() == 'LONG' and structural_sl: fallback_sl = min(base_sl_atr, structural_sl)
-        if side.upper() == 'SHORT' and structural_sl: fallback_sl = max(base_sl_atr, structural_sl)
+        bids = orderbook['bids'][:depth]  # [[price, qty], ...]
+        asks = orderbook['asks'][:depth]
+        
+        # Расчет базовых метрик
+        bid_volume = sum(float(b[1]) for b in bids)
+        ask_volume = sum(float(a[1]) for a in asks)
+        
+        # Защита от деления на ноль
+        total_volume = bid_volume + ask_volume
+        imbalance = (bid_volume - ask_volume) / total_volume if total_volume > 0 else 0
+        
+        best_bid = float(bids[0][0]) if bids else 0
+        best_ask = float(asks[0][0]) if asks else 0
+        mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+        spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 else 0
+        
+        return {
+            'bids': bids,
+            'asks': asks,
+            'bid_volume': bid_volume,
+            'ask_volume': ask_volume,
+            'imbalance': imbalance,
+            'best_bid': best_bid,
+            'best_ask': best_ask,
+            'mid_price': mid_price,
+            'spread_pct': spread_pct,
+            'timestamp': orderbook.get('lastUpdateId', 0)
+        }
+        
+    except Exception as e:
+        logging.error(f"{symbol} | get_orderbook_snapshot error: {e}", exc_info=True)
+        return None
+
+
+def detect_liquidity_walls(orderbook_data: Dict[str, Any], threshold: float = 2.5) -> Dict[str, list]:
+    """
+    Обнаруживает крупные стенки ликвидности (walls) в стакане.
+    
+    Args:
+        orderbook_data: Данные стакана из get_orderbook_snapshot
+        threshold: Множитель среднего объема для определения "стенки" (по умолчанию 2.5x)
+    
+    Returns:
+        Dict с bid_walls и ask_walls
+    """
+    try:
+        bids = orderbook_data['bids']
+        asks = orderbook_data['asks']
+        
+        if not bids or not asks:
+            return {'bid_walls': [], 'ask_walls': []}
+        
+        # Средние объемы
+        avg_bid_vol = sum(float(b[1]) for b in bids) / len(bids)
+        avg_ask_vol = sum(float(a[1]) for a in asks) / len(asks)
+        
+        # Находим стенки (объем > threshold * средний)
+        bid_walls = [
+            {
+                'price': float(b[0]),
+                'volume': float(b[1]),
+                'distance_pct': (orderbook_data['mid_price'] - float(b[0])) / orderbook_data['mid_price'] * 100,
+                'type': 'BID_WALL'
+            }
+            for b in bids if float(b[1]) > avg_bid_vol * threshold
+        ]
+        
+        ask_walls = [
+            {
+                'price': float(a[0]),
+                'volume': float(a[1]),
+                'distance_pct': (float(a[0]) - orderbook_data['mid_price']) / orderbook_data['mid_price'] * 100,
+                'type': 'ASK_WALL'
+            }
+            for a in asks if float(a[1]) > avg_ask_vol * threshold
+        ]
+        
+        return {
+            'bid_walls': sorted(bid_walls, key=lambda x: x['distance_pct']),
+            'ask_walls': sorted(ask_walls, key=lambda x: x['distance_pct'])
+        }
             
-        # --- ✅ ИЗМЕНЕНИЕ: Расчет TP1 и TP2 для фолбэка ---
-        risk_dist = abs(entry_price - fallback_sl)
-        fallback_tp1 = entry_price + (risk_dist * TP1_RR) if side.upper() == "LONG" else entry_price - (risk_dist * TP1_RR)
-        fallback_tp2 = entry_price + (risk_dist * TP2_RR) if side.upper() == "LONG" else entry_price - (risk_dist * TP2_RR)
-        fallback_sltp = {"stop_loss": fallback_sl, "take_profit_1": fallback_tp1, "take_profit_2": fallback_tp2}
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-
-        # Остальные данные для промпта
-        adx_val = ta.trend.adx(df_15m['high'], df_15m['low'], df_15m['close'], 14).iloc[-1]
-        hmm_regime_id = market_regimes.get(symbol, 1)
-        hmm_regime_name = REGIME_CONFIG.get(hmm_regime_id, {}).get('name', 'Unknown')
-        tick_size = exchange_info_cache.get(symbol, {}).get('tickSize', '0.00001')
-
     except Exception as e:
-        logging.error(f"{log_prefix} Ошибка сбора контекста: {e}. Расчет отменен.")
-        return {"stop_loss": None, "take_profit_1": None, "take_profit_2": None} # Возвращаем None
+        logging.error(f"detect_liquidity_walls error: {e}")
+        return {'bid_walls': [], 'ask_walls': []}
 
-    # --- Шаг 2: Формирование промпта (✅ Запрашиваем TP1 и TP2) ---
-    prompt = f"""
-Задача: выдать уровни Stop Loss, Take Profit 1 (TP1) и Take Profit 2 (TP2) для сделки {side.upper()} по {symbol} с ценой входа {entry_price:.5f}.
-Контекст: HMM='{hmm_regime_name}', ADX={adx_val:.1f}, ATR(14)={atr_val:.5f}.
-Требования:
-1) Для LONG: StopLoss < {entry_price:.5f}, TP1 > {entry_price:.5f}, TP2 > TP1. Для SHORT: StopLoss > {entry_price:.5f}, TP1 < {entry_price:.5f}, TP2 < TP1.
-2) RR(TP1) должен быть >= {TP1_RR:.1f}.
-3) RR(TP2) должен быть >= {TP2_RR:.1f}.
-4) StopLoss должен быть на безопасном расстоянии, не ближе чем {fallback_sl:.5f}.
-Вывод: строго JSON с полями "stop_loss", "take_profit_1", "take_profit_2".
-"""
-    # --- Шаг 3: Вызов AI и "БРОНЕБОЙНАЯ" ВАЛИДАЦИЯ ---
+def format_orderbook_for_prompt(orderbook_data: Dict[str, Any], levels: int = 10) -> str:
+    """Форматирует стакан в читаемый текст для промпта"""
     try:
-        loop = asyncio.get_running_loop()
-        response_data = await loop.run_in_executor(None, partial(sync_deepseek_request, prompt, DEEPSEEK_CHAT_COMPLETIONS_URL, True))
-        if not response_data or 'choices' not in response_data:
-            raise ValueError("Пустой ответ от AI")
-
-        content = response_data['choices'][0]['message']['content']
-        ai_data = json.loads(content)
-        sl = float(ai_data["stop_loss"])
-        tp1 = float(ai_data["take_profit_1"])
-        tp2 = float(ai_data["take_profit_2"])
-
-        # --- ✅ БЛОК-ВЫШИБАЛА: Проверяем ответ AI на адекватность ---
-        is_long_logic_ok = side.upper() == 'LONG' and sl < entry_price and tp1 > entry_price and tp2 > tp1
-        is_short_logic_ok = side.upper() == 'SHORT' and sl > entry_price and tp1 < entry_price and tp2 < tp1
+        lines = []
         
-        if not (is_long_logic_ok or is_short_logic_ok):
-            raise ValueError(f"AI предоставил нелогичные уровни для {side.upper()}. SL={sl}, TP1={tp1}, TP2={tp2}. Переключаюсь на фолбэк.")
-        # --- КОНЕЦ ВАЛИДАЦИИ ---
-
-        logging.warning(f"{log_prefix} AI Вердикт прошел валидацию. SL={sl}, TP1={tp1}, TP2={tp2}.")
-        return {"stop_loss": sl, "take_profit_1": tp1, "take_profit_2": tp2}
-
+        # BID сторона
+        lines.append("**BID (покупатели):**")
+        for i, (price, qty) in enumerate(orderbook_data['bids'][:levels]):
+            lines.append(f"  {i+1}. {float(price):.5f} | {float(qty):.4f}")
+        
+        lines.append("")
+        
+        # ASK сторона
+        lines.append("**ASK (продавцы):**")
+        for i, (price, qty) in enumerate(orderbook_data['asks'][:levels]):
+            lines.append(f"  {i+1}. {float(price):.5f} | {float(qty):.4f}")
+        
+        return "\n".join(lines)
+            
     except Exception as e:
-        logging.error(f"{log_prefix} Ошибка обработки ответа AI: {e}. Используется ATR-fallback.")
-        return fallback_sltp # Возвращаем фолбэк со всеми тремя значениями
+        logging.error(f"format_orderbook_for_prompt error: {e}")
+        return ""
+
+def format_walls_for_prompt(walls: Dict[str, list]) -> str:
+    """Форматирует обнаруженные стенки для промпта"""
+    try:
+        lines = []
+        
+        if walls['bid_walls']:
+            lines.append("**Крупные BID стенки (поддержка):**")
+            for w in walls['bid_walls'][:5]:  # Топ 5
+                lines.append(f"  • {w['price']:.5f} | Vol: {w['volume']:.4f} | Дистанция: {w['distance_pct']:.2f}%")
+        else:
+            lines.append("**Крупные BID стенки:** не обнаружены")
+        
+        lines.append("")
+        
+        if walls['ask_walls']:
+            lines.append("**Крупные ASK стенки (сопротивление):**")
+            for w in walls['ask_walls'][:5]:
+                lines.append(f"  • {w['price']:.5f} | Vol: {w['volume']:.4f} | Дистанция: {w['distance_pct']:.2f}%")
+        else:
+            lines.append("**Крупные ASK стенки:** не обнаружены")
+        
+        return "\n".join(lines)
+            
+    except Exception as e:
+        logging.error(f"format_walls_for_prompt error: {e}")
+        return ""
+
+async def send_to_gemini_with_json_schema(prompt: str) -> Optional[Dict[str, Any]]:
+    """
+    Отправляет промпт в Gemini и получает структурированный JSON ответ.
+    
+    Args:
+        prompt: Текст запроса
+    
+    Returns:
+        Dict с stoploss, takeprofit1, takeprofit2, reasoning
+    """
+    # Используем существующий AI_REQUEST_SEMAPHORE
+    global AI_REQUEST_SEMAPHORE, GEMINI_MODEL
+    
+    async with AI_REQUEST_SEMAPHORE:
+        try:
+            # Создаем модель с JSON schema
+            model = genai.GenerativeModel(GEMINI_MODEL) # Используем существующую GEMINI_MODEL
+            
+            # Явно определяем JSON schema для ответа
+            generation_config = genai.GenerationConfig(
+                temperature=0.5, # Установлено значение по умолчанию
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "stoploss": {
+                            "type": "number",
+                            "description": "Цена Stop Loss"
+                        },
+                        "takeprofit1": {
+                            "type": "number",
+                            "description": "Цена первого Take Profit (TP1)"
+                        },
+                        "takeprofit2": {
+                            "type": "number",
+                            "description": "Цена второго Take Profit (TP2)"
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Краткое объяснение выбора уровней"
+                        }
+                    },
+                    "required": ["stoploss", "takeprofit1", "takeprofit2", "reasoning"]
+                }
+            )
+            
+            # Отправляем запрос
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: model.generate_content(
+                    prompt,
+                    generation_config=generation_config
+                )
+            )
+            
+            # Парсим JSON
+            result = json.loads(response.text)
+            
+            return result
+                    
+        except json.JSONDecodeError as e:
+            logging.error(f"Gemini JSON parse error: {e}. Response: {response.text[:500]}")
+            return None
+                    
+        except Exception as e:
+            logging.error(f"send_to_gemini_with_json_schema error: {e}", exc_info=True)
+            return None
+
+async def get_sltp_fallback_atr(
+    symbol: str,
+    side: str,
+    entryprice: float) -> Dict[str, Optional[float]]:
+    """
+    Резервная функция расчета SL/TP через ATR.
+    Используется если Gemini не доступен или вернул ошибку.
+    """
+    try:
+        # Исправлена опечатка marketdatastore -> market_data_store
+        df_short = market_data_store.get(symbol, {}).get(ALLOWED_INTERVALS.get("5m"))
+        
+        if df_short is None or len(df_short) < 20:
+            logging.error(f"{symbol} | Нет данных для fallback ATR расчета.")
+            return {'stop_loss': None, 'take_profit_1': None, 'take_profit_2': None}
+        
+        # Используем существующую функцию _atr
+        atr_val = _atr(df_short, 14)
+        
+        if atr_val <= 0:
+            raise ValueError("ATR = 0")
+        
+        # Расчет через ATR (используем существующие глобальные константы)
+        if side.upper() == "LONG":
+            sl_atr = entryprice - (atr_val * DEFAULT_ATR_MULTIPLIER)
+            tp1_atr = entryprice + (atr_val * DEFAULT_ATR_MULTIPLIER * PARTIAL_TP_RR)
+            tp2_atr = entryprice + (atr_val * DEFAULT_ATR_MULTIPLIER * (PARTIAL_TP_RR * 2))
+        else:  # SHORT
+            sl_atr = entryprice + (atr_val * DEFAULT_ATR_MULTIPLIER)
+            tp1_atr = entryprice - (atr_val * DEFAULT_ATR_MULTIPLIER * PARTIAL_TP_RR)
+            tp2_atr = entryprice - (atr_val * DEFAULT_ATR_MULTIPLIER * (PARTIAL_TP_RR * 2))
+        
+        logging.warning(f"{symbol} | Fallback ATR: SL={sl_atr:.5f}, TP1={tp1_atr:.5f}, TP2={tp2_atr:.5f}")
+        
+        return {
+            'stop_loss': sl_atr,
+            'take_profit_1': tp1_atr,
+            'take_profit_2': tp2_atr
+        }
+            
+    except Exception as e:
+        logging.error(f"{symbol} | get_sltp_fallback_atr error: {e}")
+        return {'stop_loss': None, 'take_profit_1': None, 'take_profit_2': None}
+
+# ============================================================================
+# 6. ГЛАВНАЯ ФУНКЦИЯ - ЗАМЕНА get_sltp_from_ai_async
+# ============================================================================
+async def get_sltp_from_ai_async(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    context: dict = {}) -> Dict[str, Optional[float]]:
+    """
+    НОВАЯ ФУНКЦИЯ: Анализирует стакан через Gemini и возвращает SL/TP.
+    (Заменяет старую get_sltp_from_ai_async с DeepSeek).
+    
+    Args:
+        symbol: Торговая пара
+        side: 'LONG' или 'SHORT'
+        entry_price: Цена входа
+        context: Дополнительный контекст (HMM режим, ADX и т.д.)
+    
+    Returns:
+        Dict {'stop_loss': float, 'take_profit_1': float, 'take_profit_2': float}
+    """
+    try:
+        # 1. Получаем стакан
+        logging.info(f"{symbol} | Получаем стакан для анализа через Gemini...")
+        orderbook_data = await get_orderbook_snapshot(symbol, depth=50)
+        
+        if not orderbook_data:
+            logging.error(f"{symbol} | Не удалось получить стакан. Используем fallback ATR.")
+            return await get_sltp_fallback_atr(symbol, side, entry_price)
+        
+        # 2. Обнаруживаем крупные стенки
+        walls = detect_liquidity_walls(orderbook_data, threshold=2.5)
+        
+        # 3. Получаем дополнительные данные для контекста
+        # Исправлена опечатка marketdatastore -> market_data_store
+        df_short = market_data_store.get(symbol, {}).get(ALLOWED_INTERVALS.get("5m"))
+        
+        if df_short is None or len(df_short) < 20:
+            logging.warning(f"{symbol} | Недостаточно данных для контекста.")
+            context_indicators = "Нет данных по индикаторам"
+        else:
+            # Рассчитываем индикаторы для контекста
+            atr_val = _atr(df_short, 14) # Используем _atr
+            adx_val = adx(df_short['high'], df_short['low'], df_short['close'], 14).iloc[-1]
+            rsi_val = rsi(df_short['close'], 14).iloc[-1]
+            
+            context_indicators = (
+                f"ATR(14): {atr_val:.5f}, "
+                f"ADX(14): {adx_val:.1f}, "
+                f"RSI(14): {rsi_val:.1f}"
+            )
+        
+        # 4. Формируем промпт для Gemini
+        prompt = f"""Ты - профессиональный трейдер криптовалют. Проанализируй стакан заявок и определи оптимальные уровни Stop Loss и Take Profit.
+**ДАННЫЕ ПОЗИЦИИ:**
+- Symbol: {symbol}
+- Side: {side.upper()}
+- Entry Price: {entry_price:.5f}
+- Context: {context}
+- Indicators: {context_indicators}
+**СТАКАН ЗАЯВОК (TOP 10 LEVELS):**
+{format_orderbook_for_prompt(orderbook_data, levels=10)}
+**МЕТРИКИ СТАКАНА:**
+- Bid/Ask Imbalance: {orderbook_data['imbalance']:.2%}
+- Spread: {orderbook_data['spread_pct']:.3%}
+- Total Bid Volume (30 levels): {orderbook_data['bid_volume']:.2f}
+- Total Ask Volume (30 levels): {orderbook_data['ask_volume']:.2f}
+- Mid Price: {orderbook_data['mid_price']:.5f}
+**ОБНАРУЖЕННЫЕ СТЕНКИ ЛИКВИДНОСТИ:**
+{format_walls_for_prompt(walls)}
+**ТВОЯ ЗАДАЧА:**
+Основываясь на анализе стакана, определи безопасные уровни SL/TP которые учитывают:
+1. **Stop Loss**:
+   - Для LONG: ставь SL ЗА ближайшей крупной BID стенкой (поддержкой), чтобы защититься от охоты за стопами
+   - Для SHORT: ставь SL ЗА ближайшей крупной ASK стенкой (сопротивлением)
+   - Минимальное расстояние от входа: 0.8-1.5%
+   - Учитывай spread и проскальзывание
+2. **Take Profit 1 (TP1)**:
+   - Первый уровень фиксации ПЕРЕД первой крупной противоположной стенкой
+   - Risk/Reward минимум 1.5:1
+   - Расстояние примерно 1.2-2% от входа
+3. **Take Profit 2 (TP2)**:
+   - Второй уровень ЗА второй стенкой, если imbalance положительный для направления
+   - Risk/Reward минимум 2.5-3:1
+   - Расстояние примерно 2.5-4% от входа
+4. **Дополнительные факторы**:
+   - Если spread > 0.15%, увеличь расстояние SL на 10-15%
+   - Если imbalance сильно против позиции (>30%), сделай SL ближе, а TP агрессивнее
+   - Если стенок мало или они далеко, используй ATR-based расчет как ориентир
+**ВАЖНО**: Все цены должны быть числами (float), без markdown, без дополнительного текста.
+Верни ТОЛЬКО валидный JSON в формате:
+{{
+  "stoploss": <число>,
+  "takeprofit1": <число>,
+  "takeprofit2": <число>,
+  "reasoning": "<краткое объяснение в 1-2 предложения>"
+}}"""
+        
+        # 5. Отправляем в Gemini
+        logging.info(f"{symbol} | Отправляем стакан в Gemini для анализа...")
+        gemini_response = await send_to_gemini_with_json_schema(prompt)
+        
+        if not gemini_response:
+            logging.error(f"{symbol} | Gemini не вернул валидный ответ. Используем fallback.")
+            return await get_sltp_fallback_atr(symbol, side, entry_price)
+        
+        # 6. Валидация ответа
+        sl = float(gemini_response['stoploss'])
+        tp1 = float(gemini_response['takeprofit1'])
+        tp2 = float(gemini_response['takeprofit2'])
+        reasoning = gemini_response.get('reasoning', 'N/A')
+        
+        # Проверка корректности SL
+        if side.upper() == "LONG":
+            if sl >= entry_price:
+                raise ValueError(f"SL для LONG должен быть < entry. SL={sl}, Entry={entry_price}")
+        else:  # SHORT
+            if sl <= entry_price:
+                raise ValueError(f"SL для SHORT должен быть > entry. SL={sl}, Entry={entry_price}")
+        
+        # Проверка минимального R:R
+        risk_dist = abs(entry_price - sl)
+        reward_dist_tp1 = abs(tp1 - entry_price)
+        rr = reward_dist_tp1 / risk_dist if risk_dist > 0 else 0
+        
+        if rr < 1.2:
+            logging.warning(f"{symbol} | R:R слишком низкий ({rr:.2f}). Корректируем TP1...")
+            # Корректируем TP1 для R:R минимум 1.5
+            if side.upper() == "LONG":
+                tp1 = entry_price + (risk_dist * 1.5)
+            else:
+                tp1 = entry_price - (risk_dist * 1.5)
+        
+        logging.warning(f"{symbol} | ✅ Gemini SL/TP установлены: "
+                       f"SL={sl:.5f}, TP1={tp1:.5f}, TP2={tp2:.5f}")
+        logging.info(f"{symbol} | Reasoning: {reasoning}")
+        
+        return {
+            'stop_loss': sl,
+            'take_profit_1': tp1,
+            'take_profit_2': tp2,
+            'reasoning': reasoning
+        }
+            
+    except Exception as e:
+        logging.error(f"{symbol} | get_sltp_from_ai_async (Gemini OB) error: {e}", exc_info=True)
+        logging.warning(f"{symbol} | Используем fallback ATR-based расчет...")
+        return await get_sltp_fallback_atr(symbol, side, entry_price)
+
+# ============================================================================
+# 10. ТЕСТИРОВАНИЕ
+# ============================================================================
+# ============================================================================
+# 10. ТЕСТИРОВАНИЕ (ИСПРАВЛЕННАЯ ВЕРСИЯ V1.1)
+# ============================================================================
+async def test_gemini_orderbook_analysis():
+    """Функция для тестирования нового функционала"""
+    
+    test_symbol = "BTCUSDT"
+    test_side = "LONG"
+    
+    print(f"\n{'='*60}")
+    print(f"ТЕСТИРОВАНИЕ GEMINI ORDERBOOK ANALYSIS")
+    print(f"{'='*60}\n")
+    
+    print(f"Symbol: {test_symbol}")
+    print(f"Side: {test_side}")
+    
+    # Тест 1: Получение стакана
+    print("1. Получение стакана...")
+    # Используем исправленный depth=20
+    orderbook = await get_orderbook_snapshot(test_symbol, depth=20)
+    if orderbook:
+        print(f"   ✅ Успешно. Imbalance: {orderbook['imbalance']:.2%}, Spread: {orderbook['spread_pct']:.3%}")
+    else:
+        print("   ❌ Ошибка получения стакана")
+        return
+        
+    # --- ✅ ИСПРАВЛЕНИЕ: УСТАНОВКА РЕАЛИСТИЧНОЙ ЦЕНЫ ВХОДА ---
+    # Используем mid_price из стакана как нашу "тестовую" цену входа
+    test_entry = orderbook.get('mid_price', 0.0)
+    if test_entry == 0.0:
+        print("   ❌ Ошибка: не удалось получить mid_price из стакана.")
+        return
+    print(f"Entry Price (Live): {test_entry}\n") # <--- Печатаем новую цену
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+    # Тест 2: Обнаружение стенок
+    print("\n2. Обнаружение стенок...")
+    walls = detect_liquidity_walls(orderbook, threshold=2.5)
+    print(f"   BID walls: {len(walls['bid_walls'])}")
+    print(f"   ASK walls: {len(walls['ask_walls'])}")
+    if walls['bid_walls']:
+        print(f"   Ближайшая BID стенка: {walls['bid_walls'][0]['price']:.5f} "
+              f"({walls['bid_walls'][0]['distance_pct']:.2f}% от mid)")
+    if walls['ask_walls']:
+        print(f"   Ближайшая ASK стенка: {walls['ask_walls'][0]['price']:.5f} "
+              f"({walls['ask_walls'][0]['distance_pct']:.2f}% от mid)")
+    
+    # Тест 3: Gemini анализ (теперь с правильной test_entry)
+    print("\n3. Отправка в Gemini для анализа...")
+    # Используем имя главной функции get_sltp_from_ai_async
+    sltp = await get_sltp_from_ai_async(test_symbol, test_side, test_entry, context={"test": "Test context"})
+    
+    if sltp and sltp.get('stop_loss'):
+        sl = sltp['stop_loss']
+        tp1 = sltp['take_profit_1']
+        tp2 = sltp['take_profit_2']
+        
+        risk_dist = abs(test_entry - sl)
+        reward_dist = abs(tp1 - test_entry)
+        rr = reward_dist / risk_dist if risk_dist > 0 else 0
+        
+        print(f"\n   ✅ РЕЗУЛЬТАТ:")
+        print(f"   Stop Loss:     {sl:.5f} ({((sl - test_entry) / test_entry * 100):.2f}%)")
+        print(f"   Take Profit 1: {tp1:.5f} ({((tp1 - test_entry) / test_entry * 100):.2f}%)")
+        print(f"   Take Profit 2: {tp2:.5f} ({((tp2 - test_entry) / test_entry * 100):.2f}%)")
+        print(f"   Risk/Reward:   {rr:.2f}:1")
+        print(f"\n   Reasoning: {sltp.get('reasoning', 'N/A')}")
+    else:
+        print("   ❌ Gemini не вернул валидный результат (или сработал fallback, проверь логи выше)")
+    
+    print(f"\n{'='*60}\n")
+    
+# ============================================================================
+# КОНЕЦ БЛОКА V-GEMINI-OB
+# ============================================================================
 
 async def start_websockets(symbols_to_stream_list: List[str]):
     """
@@ -12600,12 +13025,12 @@ async def run_bot():
         import ta
         for symbol in SYMBOLS:
             # Проверяем только если нет открытой позиции по этому символу
-            # и символ есть в загруженных данных
+            #  и символ есть в загруженных данных
             if symbol not in current_positions and symbol in market_data_store:
                 logging.debug(f" -> Первоначальная проверка для {symbol}...")
                 # Собираем задачи для асинхронного выполнения
                 # Добавьте сюда вызовы ВСЕХ ваших функций поиска входа
-                initial_check_tasks.append(find_and_execute_ranging_trade_v4_3(symbol)) # Ranging (вызывает on_closed_candle_analysis)
+                #initial_check_tasks.append(find_and_execute_ranging_trade_v4_3(symbol)) # Ranging (вызывает on_closed_candle_analysis)
                 initial_check_tasks.append(find_and_execute_pullback_trade(symbol)) # Pullback
                 initial_check_tasks.append(find_and_execute_impulse_trade(symbol)) # Impulse
                 # Breakout
@@ -12638,6 +13063,7 @@ async def run_bot():
         # <--- ИСПРАВЛЕНИЕ 1: ЗАПУСКАЕМ СТРИМ ЛИКВИДАЦИЙ ---
         liq_stream_task = asyncio.create_task(stream_liquidations(SYMBOLS), name="LiquidationStreamTask")
         
+        await test_gemini_orderbook_analysis()
         await stop_event.wait()
 
 
