@@ -9122,16 +9122,19 @@ async def manage_donchian_trailing_stop(manager: PositionManager):
             potential_new_sl = last_middle_line - volatility_buffer
             if potential_new_sl > pos.sl_price:
                 logging.warning(f"📈 [{manager.symbol}] TRAILING STOP (Donchian): SL перемещается с {pos.sl_price:.4f} на {potential_new_sl:.4f}")
-                await manager._update_sl_callback(manager.symbol, potential_new_sl, "Donchian Trail")
+                # --- ✅ ИСПРАВЛЕНИЕ: Убран лишний аргумент manager.symbol ---
+                await manager._update_sl_callback(potential_new_sl, "Donchian Trail")
 
         elif pos.side.upper() == 'SHORT' and pos.sl_price is not None:
             potential_new_sl = last_middle_line + volatility_buffer
             if potential_new_sl < pos.sl_price:
                 logging.warning(f"📉 [{manager.symbol}] TRAILING STOP (Donchian): SL перемещается с {pos.sl_price:.4f} на {potential_new_sl:.4f}")
-                await manager._update_sl_callback(manager.symbol, potential_new_sl, "Donchian Trail")
+                # --- ✅ ИСПРАВЛЕНИЕ: Убран лишний аргумент manager.symbol ---
+                await manager._update_sl_callback(potential_new_sl, "Donchian Trail")
 
     except Exception as e:
-        logging.error(f"[{manager.symbol}] Ошибка в логике трейлинга по Дончиану: {e}")
+        # Теперь здесь будет выводиться полная ошибка, если она не TypeError
+        logging.error(f"[{manager.symbol}] Ошибка в логике трейлинга по Дончиану: {e}", exc_info=True)
 
 def calculate_donchian_channels(df: pd.DataFrame, period: int = 40) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """Рассчитывает верхнюю, нижнюю и среднюю линии Канала Дончиана."""
